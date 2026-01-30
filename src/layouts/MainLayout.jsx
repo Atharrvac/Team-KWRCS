@@ -1,7 +1,20 @@
-import { Link, Outlet } from 'react-router-dom';
+import { Link, Outlet, useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
+import { useAuth } from '@/context/AuthContext';
 
 const Layout = () => {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      navigate('/login');
+    } catch (error) {
+      console.error('Error logging out:', error);
+    }
+  };
+
   return (
     <div className="min-h-screen flex flex-col">
       <header className="border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50">
@@ -23,20 +36,42 @@ const Layout = () => {
               >
                 About
               </Link>
-              <Link
-                to="/dashboard"
-                className="flex items-center text-sm font-medium text-muted-foreground hover:text-primary"
-              >
-                Dashboard
-              </Link>
-
+              {user && (
+                <Link
+                  to="/dashboard"
+                  className="flex items-center text-sm font-medium text-muted-foreground hover:text-primary"
+                >
+                  Dashboard
+                </Link>
+              )}
             </nav>
           </div>
           <div className="flex items-center gap-4">
-            <Button size="sm">Get Started</Button>
+            {user ? (
+              <div className="flex items-center gap-4">
+                <span className="text-sm text-muted-foreground hidden md:inline-block">
+                  {user.email}
+                </span>
+                <Button variant="outline" size="sm" onClick={handleLogout}>
+                  Logout
+                </Button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <Link to="/login">
+                  <Button variant="ghost" size="sm">
+                    Login
+                  </Button>
+                </Link>
+                <Link to="/signup">
+                  <Button size="sm">Get Started</Button>
+                </Link>
+              </div>
+            )}
           </div>
         </div>
       </header>
+
 
       <main className="flex-1">
         <div className="container py-6">
