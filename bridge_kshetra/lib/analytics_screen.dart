@@ -32,15 +32,25 @@ class NearbySensorData {
   });
 
   factory NearbySensorData.fromJson(Map<String, dynamic> json) {
+    // Helper function to parse values that might be String or num
+    double _parseDouble(dynamic value) {
+      if (value is num) {
+        return value.toDouble();
+      } else if (value is String) {
+        return double.parse(value);
+      }
+      return 0.0;
+    }
+
     return NearbySensorData(
       id: json['id'] as String,
-      temp: (json['temp'] as num).toDouble(),
-      humidity: (json['humidity'] as num).toDouble(),
-      airQuality: (json['air_quality'] as num).toDouble(),
-      lat: (json['lat'] as num).toDouble(),
-      lang: (json['lang'] as num).toDouble(),
+      temp: _parseDouble(json['temp']),
+      humidity: _parseDouble(json['humidity']),
+      airQuality: _parseDouble(json['air_quality']),
+      lat: _parseDouble(json['lat']),
+      lang: _parseDouble(json['lang']),
       timestamp: DateTime.parse(json['timestamp'] as String),
-      distanceKm: (json['distance_km'] as num).toDouble(),
+      distanceKm: json.containsKey('distance_km') ? _parseDouble(json['distance_km']) : 0.0,
     );
   }
 }
@@ -81,7 +91,7 @@ class AnalyticsApiService {
           'distance': '100m',
         }),
       )
-          .timeout(const Duration(seconds: 8));
+          .timeout(const Duration(seconds: 10));
 
       debugPrint('📡 Response status: ${response.statusCode}');
       debugPrint('📡 Response body: ${response.body}');
@@ -126,7 +136,7 @@ class AnalyticsScreen extends StatefulWidget {
 class _AnalyticsScreenState extends State<AnalyticsScreen>
     with TickerProviderStateMixin {
   List<NearbySensorData> _sensors = [];
-  bool _isLoading = true;
+  bool _isLoading = false;
   bool _isLoadingLocation = true;
   MetricType _selectedMetric = MetricType.airQuality;
   ChartType _selectedChart = ChartType.line;
@@ -194,33 +204,72 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
 
   Future<void> _initializeLocation() async {
     try {
-      LocationPermission permission = await Geolocator.checkPermission();
+      setState(() {
+        _isLoadingLocation = true;
+        _locationError = null;
+      });
 
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
-
-      if (permission == LocationPermission.deniedForever ||
-          permission == LocationPermission.denied) {
+      // Check if location services are enabled
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
         if (mounted) {
           setState(() {
             _isLoadingLocation = false;
             _hasLocationPermission = false;
-            _locationError = 'Location permission denied';
-            _isLoading = false;
+            _locationError = 'Location services are disabled. Please enable location services.';
           });
         }
         return;
       }
 
+      // Check and request permissions
+      LocationPermission permission = await Geolocator.checkPermission();
+      debugPrint('📍 Current permission: $permission');
+
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        debugPrint('📍 Permission after request: $permission');
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        if (mounted) {
+          setState(() {
+            _isLoadingLocation = false;
+            _hasLocationPermission = false;
+            _locationError = 'Location permission permanently denied. Please enable in settings.';
+          });
+        }
+        return;
+      }
+
+      if (permission == LocationPermission.denied) {
+        if (mounted) {
+          setState(() {
+            _isLoadingLocation = false;
+            _hasLocationPermission = false;
+            _locationError = 'Location permission denied';
+          });
+        }
+        return;
+      }
+
+      // Get current position with extended timeout and lower accuracy for faster response
+      debugPrint('📍 Getting current position...');
       final position = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 10),
+          accuracy: LocationAccuracy.medium, // Changed from high to medium for faster response
+          timeLimit: Duration(seconds: 30), // Increased timeout from 10 to 30 seconds
         ),
+      ).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          throw TimeoutException('Location request timed out. Please try again.');
+        },
       );
 
       if (!mounted) return;
+
+      debugPrint('📍 Location obtained: ${position.latitude}, ${position.longitude}');
 
       setState(() {
         _userLat = position.latitude;
@@ -231,18 +280,26 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
 
       debugPrint('📍 Analytics Location: ${position.latitude}, ${position.longitude}');
 
-      // Now fetch data with location
+      // Now fetch data with user's current location
       await _fetchData();
       _startAutoRefresh();
 
+    } on TimeoutException catch (e) {
+      debugPrint('❌ Location timeout: $e');
+      if (mounted) {
+        setState(() {
+          _isLoadingLocation = false;
+          _hasLocationPermission = false;
+          _locationError = 'Location request timed out. Check if GPS is enabled.';
+        });
+      }
     } catch (e) {
       debugPrint('❌ Location error: $e');
       if (mounted) {
         setState(() {
           _isLoadingLocation = false;
           _hasLocationPermission = false;
-          _locationError = 'Failed to get location';
-          _isLoading = false;
+          _locationError = 'Failed to get location: ${e.toString()}';
         });
       }
     }
@@ -250,8 +307,8 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
 
   void _startAutoRefresh() {
     _refreshTimer?.cancel();
-    _refreshTimer = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (_userLat != null && _userLng != null) {
+    _refreshTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (_userLat != null && _userLng != null && mounted) {
         _fetchData();
       }
     });
@@ -259,12 +316,18 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
 
   Future<void> _fetchData() async {
     if (_userLat == null || _userLng == null) {
-      debugPrint('❌ Cannot fetch data: Location not available');
+      debugPrint('❌ Cannot fetch data: User location not available');
       return;
     }
 
+    setState(() {
+      _isLoading = true;
+    });
+
+    debugPrint('🔍 Fetching sensors for USER location: $_userLat, $_userLng');
+
     final sensors = await AnalyticsApiService.getNearbySensors(
-      lat: _userLat!,
+      lat: _userLat!, // Using USER's current location, not sensor location
       lang: _userLng!,
     );
 
@@ -403,12 +466,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
       return _buildLocationErrorState();
     }
 
-    // Show data loading state
-    if (_isLoading) {
-      return _buildLoadingState();
-    }
-
-    // Show content
+    // Show content (data loading will be shown inline)
     return _buildContent();
   }
 
@@ -418,8 +476,8 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Container(
-            width: 80,
-            height: 80,
+            width: 100,
+            height: 100,
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 colors: [
@@ -427,7 +485,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                   const Color(0xFF00BCD4).withValues(alpha: 0.3),
                 ],
               ),
-              borderRadius: BorderRadius.circular(20),
+              borderRadius: BorderRadius.circular(24),
             ),
             child: const Center(
               child: CircularProgressIndicator(
@@ -436,21 +494,26 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
               ),
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 32),
           const Text(
             'Getting your location...',
             style: TextStyle(
-              color: Colors.white70,
-              fontSize: 16,
-              fontWeight: FontWeight.w500,
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 8),
-          Text(
-            'This is required to find nearby sensors',
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.4),
-              fontSize: 14,
+          const SizedBox(height: 12),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 48),
+            child: Text(
+              'This may take up to 30 seconds.\nPlease ensure GPS is enabled.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.6),
+                fontSize: 14,
+                height: 1.5,
+              ),
             ),
           ),
         ],
@@ -466,7 +529,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Container(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(32),
               decoration: BoxDecoration(
                 gradient: LinearGradient(
                   colors: [
@@ -474,52 +537,69 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                     const Color(0xFFFF3D00).withValues(alpha: 0.3),
                   ],
                 ),
-                borderRadius: BorderRadius.circular(20),
+                borderRadius: BorderRadius.circular(24),
               ),
               child: const Icon(
                 Icons.location_off_rounded,
                 color: Color(0xFFFF6B6B),
-                size: 64,
+                size: 72,
               ),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 32),
             const Text(
               'Location Required',
               style: TextStyle(
                 color: Colors.white,
-                fontSize: 24,
+                fontSize: 26,
                 fontWeight: FontWeight.w700,
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 16),
             Text(
               _locationError ?? 'Location permission is required to analyze nearby sensors',
               textAlign: TextAlign.center,
               style: TextStyle(
-                color: Colors.white.withValues(alpha: 0.6),
+                color: Colors.white.withValues(alpha: 0.7),
                 fontSize: 16,
+                height: 1.6,
               ),
             ),
-            const SizedBox(height: 32),
+            const SizedBox(height: 40),
             ElevatedButton.icon(
               onPressed: _initializeLocation,
-              icon: const Icon(Icons.refresh_rounded),
-              label: const Text('Retry'),
+              icon: const Icon(Icons.refresh_rounded, size: 22),
+              label: const Text(
+                'Try Again',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              ),
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF2196F3),
                 foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 18),
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: BorderRadius.circular(16),
                 ),
+                elevation: 0,
               ),
             ),
             const SizedBox(height: 16),
-            TextButton(
+            TextButton.icon(
+              onPressed: () async {
+                await Geolocator.openLocationSettings();
+              },
+              icon: const Icon(Icons.settings_rounded, size: 18),
+              label: const Text('Open Location Settings'),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.white70,
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextButton.icon(
               onPressed: () => Navigator.pop(context),
-              child: const Text(
-                'Go Back',
-                style: TextStyle(color: Colors.white60),
+              icon: const Icon(Icons.arrow_back_rounded, size: 18),
+              label: const Text('Go Back'),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.white60,
               ),
             ),
           ],
@@ -565,49 +645,21 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
       ),
       centerTitle: true,
       actions: [
-        IconButton(
-          icon: const Icon(Icons.refresh_rounded, color: Colors.white),
-          onPressed: _fetchData,
-        ),
-      ],
-    );
-  }
-
-  Widget _buildLoadingState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Container(
-            width: 80,
-            height: 80,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [
-                  const Color(0xFF00E676).withValues(alpha: 0.3),
-                  const Color(0xFF00BCD4).withValues(alpha: 0.3),
-                ],
-              ),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: const Center(
+        if (_hasLocationPermission)
+          IconButton(
+            icon: _isLoading
+                ? const SizedBox(
+              width: 20,
+              height: 20,
               child: CircularProgressIndicator(
-                color: Color(0xFF00E676),
-                strokeWidth: 3,
+                strokeWidth: 2,
+                color: Colors.white,
               ),
-            ),
+            )
+                : const Icon(Icons.refresh_rounded, color: Colors.white),
+            onPressed: _isLoading ? null : _fetchData,
           ),
-          const SizedBox(height: 24),
-          const Text(
-            'Analyzing nearby sensors...',
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 16,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
-      ),
+      ],
     );
   }
 
@@ -620,6 +672,31 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
 
           // Summary Cards
           SliverToBoxAdapter(child: _buildSummarySection()),
+
+          // Show loading indicator if fetching data
+          if (_isLoading && _sensors.isEmpty)
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.all(40),
+                child: Center(
+                  child: Column(
+                    children: [
+                      const CircularProgressIndicator(
+                        color: Color(0xFF00E676),
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Loading sensor data...',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.7),
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
 
           // Only show analytics if we have sensor data
           if (_sensors.isNotEmpty) ...[
@@ -647,7 +724,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
 
             // Distribution Chart
             SliverToBoxAdapter(child: _buildDistributionChart()),
-          ] else ...[
+          ] else if (!_isLoading) ...[
             // Empty state with helpful message
             SliverToBoxAdapter(child: const SizedBox(height: 40)),
             SliverToBoxAdapter(child: _buildEmptyState()),
@@ -685,26 +762,26 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
             ),
             const SizedBox(height: 24),
             const Text(
-              'No Analytics Available',
+              'No Sensors Nearby',
               style: TextStyle(
                 color: Colors.white,
-                fontSize: 22,
+                fontSize: 24,
                 fontWeight: FontWeight.w700,
               ),
             ),
             const SizedBox(height: 12),
             Text(
-              'There are no sensors within 100m of your location.\nTry moving closer to sensor locations.',
+              'No sensors found within 100m of your current location.\nTry moving to a different area or check back later.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: Colors.white.withValues(alpha: 0.6),
                 fontSize: 15,
-                height: 1.5,
+                height: 1.6,
               ),
             ),
             const SizedBox(height: 32),
             Container(
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.all(24),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.05),
                 borderRadius: BorderRadius.circular(16),
@@ -717,25 +794,25 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                   const Icon(
                     Icons.tips_and_updates_rounded,
                     color: Color(0xFFFFEA00),
-                    size: 32,
+                    size: 36,
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 16),
                   const Text(
                     'Tip',
                     style: TextStyle(
                       color: Colors.white,
-                      fontSize: 16,
+                      fontSize: 18,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'Analytics will automatically appear once sensors are detected nearby. The data refreshes every 10 seconds.',
+                    'Analytics will automatically appear once sensors are detected nearby. Data refreshes every 15 seconds.',
                     textAlign: TextAlign.center,
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.7),
-                      fontSize: 13,
-                      height: 1.4,
+                      fontSize: 14,
+                      height: 1.5,
                     ),
                   ),
                 ],
@@ -765,10 +842,10 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                   fontWeight: FontWeight.w700,
                 ),
               ),
-              const SizedBox(height: 8),
-              if (_sensors.isEmpty)
+              const SizedBox(height: 16),
+              if (_sensors.isEmpty && !_isLoading)
                 Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  padding: const EdgeInsets.only(bottom: 16),
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(16),
                     child: BackdropFilter(
@@ -823,7 +900,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                                     'No sensors found within 100m radius',
                                     style: TextStyle(
                                       color: Colors.white60,
-                                      fontSize: 12,
+                                      fontSize: 13,
                                     ),
                                   ),
                                 ],
@@ -835,7 +912,6 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                     ),
                   ),
                 ),
-              const SizedBox(height: 16),
               Row(
                 children: [
                   Expanded(
@@ -859,8 +935,8 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                   Expanded(
                     child: _buildSummaryCard(
                       icon: Icons.my_location_rounded,
-                      label: 'Location',
-                      value: _userLat != null ? '${_userLat!.toStringAsFixed(4)}°' : 'N/A',
+                      label: 'Your Location',
+                      value: _userLat != null ? '${_userLat!.toStringAsFixed(3)}°' : 'N/A',
                       color: const Color(0xFFFF6B6B),
                     ),
                   ),
@@ -915,19 +991,23 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                 const SizedBox(height: 12),
                 Text(
                   label,
+                  textAlign: TextAlign.center,
                   style: const TextStyle(
                     color: Colors.white60,
-                    fontSize: 12,
+                    fontSize: 11,
                     fontWeight: FontWeight.w500,
                   ),
                 ),
                 const SizedBox(height: 4),
-                Text(
-                  value,
-                  style: TextStyle(
-                    color: color,
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    value,
+                    style: TextStyle(
+                      color: color,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ],
@@ -1021,13 +1101,16 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                   size: 28,
                 ),
                 const SizedBox(height: 8),
-                Text(
-                  _getMetricLabel(type),
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: isSelected ? color : Colors.white60,
-                    fontSize: 11,
-                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    _getMetricLabel(type),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: isSelected ? color : Colors.white60,
+                      fontSize: 11,
+                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                    ),
                   ),
                 ),
               ],
@@ -1181,12 +1264,14 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                           ),
                         ),
                         const SizedBox(width: 12),
-                        Text(
-                          '${_getMetricLabel(_selectedMetric)} Analysis',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700,
+                        Expanded(
+                          child: Text(
+                            '${_getMetricLabel(_selectedMetric)} Analysis',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
                         ),
                       ],
@@ -1730,12 +1815,15 @@ class _AnalyticsScreenState extends State<AnalyticsScreen>
                   ),
                 ),
                 const SizedBox(height: 8),
-                Text(
-                  '${value.toStringAsFixed(1)} ${_getMetricUnit(_selectedMetric)}',
-                  style: TextStyle(
-                    color: color,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w700,
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    '${value.toStringAsFixed(1)} ${_getMetricUnit(_selectedMetric)}',
+                    style: TextStyle(
+                      color: color,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ],

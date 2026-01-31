@@ -106,25 +106,40 @@ class SensorApiService {
     required double lang,
   }) async {
     try {
+      debugPrint('📤 Attempting to post sensor data...');
+      debugPrint('   Temp: $temp, Humidity: $humidity, AQI: $airQuality');
+      debugPrint('   Location: $lat, $lang');
+
+      final requestBody = {
+        'temp': temp.toString(),
+        'humidity': humidity.toString(),
+        'air_quality': airQuality.toStringAsFixed(0),
+        'lat': lat.toStringAsFixed(6),
+        'lang': lang.toStringAsFixed(6),
+      };
+
+      debugPrint('📤 Request body: ${json.encode(requestBody)}');
+
       final response = await http
           .post(
         Uri.parse(baseUrl),
         headers: {'Content-Type': 'application/json'},
-        body: json.encode({
-          'temp': temp.toString(),
-          'humidity': humidity.toString(),
-          'air_quality': airQuality.toStringAsFixed(0),
-          'lat': lat.toStringAsFixed(6),
-          'lang': lang.toStringAsFixed(6),
-        }),
+        body: json.encode(requestBody),
       )
-          .timeout(const Duration(seconds: 5));
+          .timeout(const Duration(seconds: 8));
+
+      debugPrint('📡 Response status: ${response.statusCode}');
+      debugPrint('📡 Response body: ${response.body}');
 
       if (response.statusCode == 200 || response.statusCode == 201) {
-        debugPrint("✅ Data Uploaded ${lat.toStringAsFixed(6)} ${lang.toStringAsFixed(6)}");
-        return json.decode(response.body) as Map<String, dynamic>;
+        debugPrint("✅ Data Uploaded Successfully!");
+        debugPrint("   Location: ${lat.toStringAsFixed(6)}, ${lang.toStringAsFixed(6)}");
+        final responseData = json.decode(response.body) as Map<String, dynamic>;
+        debugPrint("   Response: $responseData");
+        return responseData;
       }
       debugPrint('❌ Post sensor data failed: ${response.statusCode}');
+      debugPrint('❌ Response: ${response.body}');
       return null;
     } catch (e) {
       debugPrint('❌ Post sensor data error: $e');
@@ -193,6 +208,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   Timer? _debounceTimer;
   final Completer<GoogleMapController> _mapController = Completer();
   late AnimationController _animController;
+
+  // Track last posted data to avoid duplicate posts
+  DateTime? _lastPostTime;
+  SensorData? _lastPostedData;
 
   // Constants
   static const String _espSensorUrl = 'http://10.118.211.144/sensor';
@@ -283,7 +302,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       if (!mounted) return;
 
       final userLoc = LatLng(position.latitude, position.longitude);
-      debugPrint("📍 User Location: ${userLoc.latitude}, ${userLoc.longitude}");
+      debugPrint("📍 User Location Updated: ${userLoc.latitude}, ${userLoc.longitude}");
 
       setState(() {
         _userLocation = userLoc;
@@ -322,6 +341,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Future<void> _fetchESP32SensorData() async {
     try {
+      debugPrint('🔄 Fetching ESP32 sensor data...');
+
       final response = await http
           .get(Uri.parse(_espSensorUrl))
           .timeout(const Duration(seconds: 8));
@@ -331,44 +352,72 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       }
 
       final data = json.decode(response.body) as Map<String, dynamic>;
+      debugPrint('📥 ESP32 Response: $data');
+
       final newSensorData = SensorData.fromJson(data);
+      debugPrint('✅ ESP32 Data Parsed: Temp=${newSensorData.temperature}°C, Humidity=${newSensorData.humidity}%, AQI=${newSensorData.airQualityRaw}');
 
-      // Only update if data actually changed
-      if (_sensorData != newSensorData) {
-        final aqiStatus = _calculateAQIStatus(newSensorData.airQualityRaw);
+      // CRITICAL FIX: Always post to API when we have valid location and sensor data
+      // Don't skip posting even if data hasn't changed
+      if (_userLocation != null) {
+        final now = DateTime.now();
 
-        // IMPORTANT: Use mobile location (not ESP32 GPS)
-        if (_userLocation != null) {
-          // Post to API using current mobile location
-          SensorApiService.postSensorData(
-            temp: newSensorData.temperature,
-            humidity: newSensorData.humidity,
-            airQuality: newSensorData.airQualityRaw,
-            lat: _userLocation!.latitude,
-            lang: _userLocation!.longitude,
-          ).then((result) {
-            if (result != null) {
-              debugPrint('✅ Posted to API: Queue size ${result['queueSize']}');
-            }
-          });
+        // Post to API - allow posting every refresh cycle
+        // This ensures data is continuously saved to the database
+        debugPrint('🚀 Posting to API with current location...');
+
+        final result = await SensorApiService.postSensorData(
+          temp: newSensorData.temperature,
+          humidity: newSensorData.humidity,
+          airQuality: newSensorData.airQualityRaw,
+          lat: _userLocation!.latitude,
+          lang: _userLocation!.longitude,
+        );
+
+        if (result != null) {
+          debugPrint('✅ Successfully posted to API!');
+          if (result.containsKey('queueSize')) {
+            debugPrint('   Queue size: ${result['queueSize']}');
+          }
+          if (result.containsKey('id')) {
+            debugPrint('   Record ID: ${result['id']}');
+          }
+          _lastPostTime = now;
+          _lastPostedData = newSensorData;
+        } else {
+          debugPrint('❌ Failed to post to API');
         }
+      } else {
+        debugPrint('⚠️ Cannot post to API: User location not available');
+      }
 
-        if (!mounted) return;
+      if (!mounted) return;
 
-        // Update state with new data
+      // Update UI state
+      final aqiStatus = _calculateAQIStatus(newSensorData.airQualityRaw);
+
+      setState(() {
+        _sensorData = newSensorData;
+        _aqiStatus = aqiStatus;
+        _isLoadingSensorData = false;
+      });
+
+      _animController.forward(from: 0.0);
+
+    } on TimeoutException {
+      debugPrint('⏱️ ESP32 timeout - sensor might be offline');
+      if (mounted) {
         setState(() {
-          _sensorData = newSensorData;
-          _aqiStatus = aqiStatus;
           _isLoadingSensorData = false;
         });
-
-        _animController.forward(from: 0.0);
-        debugPrint('✅ ESP32: ${newSensorData.temperature}°C, ${newSensorData.humidity}%, AQI: ${newSensorData.airQualityRaw}');
       }
-    } on TimeoutException {
-      debugPrint('⏱️ ESP32 timeout');
     } catch (e) {
       debugPrint('❌ ESP32 error: $e');
+      if (mounted) {
+        setState(() {
+          _isLoadingSensorData = false;
+        });
+      }
     }
   }
 
@@ -504,7 +553,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     return points;
   }
 
-  // NEW: Generate heatmap for MY sensor (current location)
+  // Generate heatmap for MY sensor (current location)
   List<WeightedLatLng> _generateHeatmapForMySensor() {
     if (_userLocation == null || _sensorData == null) return [];
 
@@ -542,7 +591,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     return points;
   }
 
-  // NEW: Get gradient colors based on normalized value
+  // Get gradient colors based on normalized value
   List<HeatmapGradientColor> _getGradientColors(double tempNorm, double humNorm, double aqiNorm) {
     if (aqiNorm > tempNorm && aqiNorm > humNorm) {
       // AQI dominant - use air quality gradient
